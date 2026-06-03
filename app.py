@@ -16,12 +16,12 @@ PAGE_ACCESS_TOKEN  = os.environ.get('PAGE_ACCESS_TOKEN', '')
 SHEET_ID           = os.environ.get('SHEET_ID', '')
 GOOGLE_CREDS_JSON  = os.environ.get('GOOGLE_CREDS_JSON', '')
 
-# Cache so we don't hit Google Sheets on every single comment
+# Cache so we don't hit Google Sheets on every comment
 _cache = {'data': {}, 'last_updated': 0}
 CACHE_DURATION = 300  # refresh every 5 minutes
 
 # ============================================================
-#  GOOGLE SHEETS — Load post replies
+#  GOOGLE SHEETS — Load post replies + DM messages
 # ============================================================
 def get_replies_from_sheet():
     global _cache
@@ -43,10 +43,14 @@ def get_replies_from_sheet():
 
         mapping = {}
         for record in records:
-            post_id   = str(record.get('Post ID', '')).strip()
-            reply     = str(record.get('Reply Text', '')).strip()
+            post_id    = str(record.get('Post ID', '')).strip()
+            reply      = str(record.get('Reply Text', '')).strip()
+            dm_message = str(record.get('DM Message', '')).strip()
             if post_id and reply:
-                mapping[post_id] = reply
+                mapping[post_id] = {
+                    'reply': reply,
+                    'dm': dm_message
+                }
 
         _cache = {'data': mapping, 'last_updated': now}
         print(f"✅ Sheet loaded — {len(mapping)} posts configured")
@@ -57,7 +61,7 @@ def get_replies_from_sheet():
         return _cache.get('data', {})
 
 # ============================================================
-#  FACEBOOK — Send reply to a comment
+#  FACEBOOK — Send public comment reply
 # ============================================================
 def send_reply(comment_id, message):
     url     = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
@@ -65,9 +69,28 @@ def send_reply(comment_id, message):
     result  = requests.post(url, data=payload).json()
 
     if 'id' in result:
-        print(f"✅ Replied to comment {comment_id}")
+        print(f"✅ Comment replied: {comment_id}")
     else:
-        print(f"❌ Reply failed: {result}")
+        print(f"❌ Comment reply failed: {result}")
+    return result
+
+# ============================================================
+#  FACEBOOK — Send private DM via Messenger
+# ============================================================
+def send_dm(user_id, message):
+    url     = f"https://graph.facebook.com/v19.0/me/messages"
+    payload = {
+        'recipient':      json.dumps({'id': user_id}),
+        'message':        json.dumps({'text': message}),
+        'messaging_type': 'RESPONSE',
+        'access_token':   PAGE_ACCESS_TOKEN
+    }
+    result = requests.post(url, data=payload).json()
+
+    if 'message_id' in result:
+        print(f"✅ DM sent to user {user_id}")
+    else:
+        print(f"⚠️ DM not sent (user may not have messaged page before): {result}")
     return result
 
 # ============================================================
@@ -80,22 +103,19 @@ def home():
 
 @app.route('/webhook', methods=['GET'])
 def verify():
-    """Facebook calls this once to confirm the webhook is real."""
     mode      = request.args.get('hub.mode')
     token     = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
 
     if mode == 'subscribe' and token == VERIFY_TOKEN:
-        print("✅ Webhook verified by Facebook!")
+        print("✅ Webhook verified!")
         return challenge, 200
 
-    print(f"❌ Bad verify token: {token}")
     return 'Forbidden', 403
 
 
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
-    """Every comment on your page arrives here."""
     data = request.json
 
     if not data or data.get('object') != 'page':
@@ -110,36 +130,45 @@ def handle_webhook():
 
             value = change.get('value', {})
 
-            # Only handle brand-new top-level comments
+            # Only handle new top-level comments
             if value.get('item') != 'comment' or value.get('verb') != 'add':
                 continue
 
             comment_id   = value.get('comment_id', '')
-            post_id      = value.get('post_id', '')   # "pageID_postID"
+            post_id      = value.get('post_id', '')
             commenter_id = str(value.get('from', {}).get('id', ''))
             parent_id    = value.get('parent_id', '')
 
-            # Skip the page's own comments (avoid infinite loop)
+            # Skip page's own comments
             if commenter_id == page_id:
                 continue
 
-            # Skip replies-to-replies (only reply to top-level comments)
+            # Skip replies to replies
             if parent_id and parent_id != post_id:
                 continue
 
-            print(f"📩 Comment on post: {post_id}")
+            print(f"📩 New comment on post: {post_id}")
 
             replies = get_replies_from_sheet()
 
-            # Try full post_id first, then short ID (after the underscore)
-            reply_text = replies.get(post_id)
-            if not reply_text and '_' in post_id:
-                reply_text = replies.get(post_id.split('_')[-1])
+            # Match post ID
+            data_for_post = replies.get(post_id)
+            if not data_for_post and '_' in post_id:
+                data_for_post = replies.get(post_id.split('_')[-1])
 
-            if reply_text and comment_id:
-                send_reply(comment_id, reply_text)
+            if data_for_post and comment_id:
+                # 1. Send public comment reply
+                reply_text = data_for_post.get('reply', '')
+                if reply_text:
+                    send_reply(comment_id, reply_text)
+
+                # 2. Send private DM if configured
+                dm_text = data_for_post.get('dm', '')
+                if dm_text and commenter_id:
+                    time.sleep(1)  # small delay between reply and DM
+                    send_dm(commenter_id, dm_text)
             else:
-                print(f"ℹ️  No reply set for post: {post_id}")
+                print(f"ℹ️ No reply configured for post: {post_id}")
 
     return jsonify({'status': 'ok'}), 200
 
